@@ -1,4 +1,3 @@
-
 name: Build Android APK
 
 on:
@@ -21,13 +20,117 @@ jobs:
         run: |
           if [ ! -f settings.gradle ]; then
             test -f Tenda-SP3-QuickSwitch-Source.zip || {
-              echo "Source ZIP not found"
+              echo 'Missing Tenda-SP3-QuickSwitch-Source.zip in repository root'
               exit 1
             }
             unzip -q -o Tenda-SP3-QuickSwitch-Source.zip -d .
           fi
           test -f app/build.gradle
           test -f settings.gradle
+
+      - name: Patch silent desktop shortcuts (V1.2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > app/src/main/java/com/tenda/sp3quick/ShortcutToggleActivity.java <<'JAVA'
+          package com.tenda.sp3quick;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.os.Bundle;
+
+          /** Invisible, short-lived entry point for pinned desktop shortcuts. */
+          public final class ShortcutToggleActivity extends Activity {
+              static final String KEY_DEVICE = "device";
+
+              @Override protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  try {
+                      String device = getIntent() == null ? null : getIntent().getStringExtra(KEY_DEVICE);
+                      if (!Devices.LIGHT.equals(device) && !Devices.FAN.equals(device)) return;
+
+                      // The widget receivers already support goAsync() for LAN requests.
+                      // Send the command there, then close the invisible Activity immediately.
+                      boolean isLight = Devices.LIGHT.equals(device);
+                      Class<?> receiver = isLight ? LightWidget.class : FanWidget.class;
+                      String action = isLight ? WidgetHelper.TOGGLE_LIGHT : WidgetHelper.TOGGLE_FAN;
+                      sendBroadcast(new Intent(this, receiver).setAction(action));
+                  } finally {
+                      finish();
+                      overridePendingTransition(0, 0);
+                  }
+              }
+          }
+          JAVA
+          cat > app/src/main/java/com/tenda/sp3quick/BaseWidget.java <<'JAVA'
+          package com.tenda.sp3quick;
+
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.widget.Toast;
+
+          abstract class BaseWidget extends AppWidgetProvider {
+              abstract String device();
+              abstract String toggleAction();
+
+              @Override public void onUpdate(Context ctx, AppWidgetManager manager, int[] ids) {
+                  WidgetHelper.updateAll(ctx);
+              }
+
+              @Override public void onReceive(Context ctx, Intent intent) {
+                  super.onReceive(ctx, intent);
+                  if (intent == null || !toggleAction().equals(intent.getAction())) return;
+
+                  // Keep the process alive while the short local network operation completes.
+                  final PendingResult pending = goAsync();
+                  final Context app = ctx.getApplicationContext();
+                  final String target = device();
+                  final Handler main = new Handler(Looper.getMainLooper());
+                  try {
+                      Controller.toggle(app, target, (success, message) -> main.post(() -> {
+                          try {
+                              String label = success ? message : Devices.name(target) + "切换失败：" +
+                                      (message == null || message.isEmpty() ? "连接失败" : message);
+                              Toast.makeText(app, label, Toast.LENGTH_SHORT).show();
+                          } finally {
+                              pending.finish();
+                          }
+                      }));
+                  } catch (RuntimeException e) {
+                      pending.finish();
+                      Toast.makeText(app, Devices.name(target) + "操作失败", Toast.LENGTH_SHORT).show();
+                  }
+              }
+          }
+          JAVA
+          python3 - <<'PYMOD'
+          from pathlib import Path
+          import re
+          s = Path('app/src/main/res/values/styles.xml')
+          t = s.read_text(encoding='utf-8')
+          t, count = re.subn(r'<style name="ShortcutTheme"[\s\S]*?</style>', '<style name="ShortcutTheme" parent="android:style/Theme.NoDisplay"/>', t)
+          if count != 1: raise SystemExit('Could not patch ShortcutTheme')
+          s.write_text(t, encoding='utf-8')
+          p = Path('app/src/main/AndroidManifest.xml')
+          t = p.read_text(encoding='utf-8')
+          old = '<activity android:name=".ShortcutToggleActivity" android:exported="true" android:theme="@style/ShortcutTheme" />'
+          new = '''<activity android:name=".ShortcutToggleActivity"
+                      android:exported="true"
+                      android:theme="@style/ShortcutTheme"
+                      android:noHistory="true"
+                      android:excludeFromRecents="true"
+                      android:taskAffinity="com.tenda.sp3quick.shortcut" />'''
+          if old not in t: raise SystemExit('Could not patch shortcut Activity manifest')
+          p.write_text(t.replace(old,new), encoding='utf-8')
+          p = Path('app/build.gradle')
+          t = p.read_text(encoding='utf-8')
+          t = t.replace('versionCode 1', 'versionCode 2').replace("versionName '1.0.0'", "versionName '1.2.0'")
+          p.write_text(t, encoding='utf-8')
+          PYMOD
 
       - name: Install Java 17
         uses: actions/setup-java@v4
@@ -47,15 +150,13 @@ jobs:
           SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          test -d "$SDK"
-
+          test -d "$SDK" || { echo "Android SDK missing: $SDK"; exit 1; }
+          echo "SDK directory: $SDK"
           if [ ! -d "$SDK/platforms/android-35" ] || [ ! -d "$SDK/build-tools/35.0.0" ]; then
-            "$SDK/cmdline-tools/latest/bin/sdkmanager" \
-              --sdk_root="$SDK" \
-              'platforms;android-35' \
-              'build-tools;35.0.0'
+            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+            test -x "$SDKMANAGER" || { echo "sdkmanager missing: $SDKMANAGER"; exit 1; }
+            "$SDKMANAGER" --sdk_root="$SDK" 'platforms;android-35' 'build-tools;35.0.0'
           fi
-
           test -d "$SDK/platforms/android-35"
           test -d "$SDK/build-tools/35.0.0"
 
